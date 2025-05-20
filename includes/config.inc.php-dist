@@ -1,69 +1,93 @@
 <?php
 
-$apipass = '';           # The PowerDNS API-key
-$apiip   = '';           # The IP of the PowerDNS API
-$apiport = '8081';       # The port of the PowerDNS API
-$apiproto      = 'http'; # http | https
-$apisslverify  = FALSE;  # Verify SSL Certificate if using https for apiproto
-$allowzoneadd  = FALSE;  # Allow normal users to add zones
-$logging = TRUE;
-$allowclearlogs = TRUE;  # Allow clearing of log entries
-$allowrotatelogs = FALSE;# Allow rotation to text file on server
+// NSEdit - Configuration (WHM Version)
+// ===================================
 
-# Log directory - if allowrotatelogs is set, this is where the logs will
-# be written. It must be writeable by the web server user.
-$logsdirectory = "../etc";
+// General settings
+$title = 'NSEdit WHM';
+$themecolor = 'blue'; // blue, red, green, orange, etc.
+$allowzoneadd = false; // Allow non-admin users to add new zones
+$allowusermanage = false; // Allow non-admin users to manage users (requires admin privileges for the page)
+$menutype = 'horizontal'; // 'horizontal' or 'vertical'
+$logo = 'img/nsedit.png'; // Path to your logo
 
-# If you configure this, nsedit will try to authenticate via WeFact too.
-# Debtors will be added to the sqlitedatabase with their crypted password.
-#$wefactapiurl = 'https://yourdomain/Pro/apiv2/api.php';
-#$wefactapikey = 'xyz';
+// Logging
+$loglevel = 1; // 0:No logging, 1:Actions (file), 2:Debug (file)
+$logfile = __DIR__ . '/../nsedit.log'; // Path for file-based logs
 
-# If you want external scripts to be able to execute stuff here, add the
-# remote-ip to $adminapiips and create a $adminapikey
-#$adminapiips = array();
-#$adminapikey = 'thisshouldbequitealongstring,youknow';
+// For SQLite DB based logging (optional, managed by logs.php, rotate-logs.php)
+// $enable_db_logging = true; // You would add this if you want to use the DB logging features
+$allowclearlogs = true;  // Allow clearing of DB log entries
+$allowrotatelogs = true; // Allow rotation of DB logs to text file on server
+$logsdirectory = __DIR__ . "/../logs_rotated"; // Ensure this directory is writable
 
-# Location of user-database. Make sure its writeable and not served by the webserver!
-$authdb  = "../etc/pdns.users.sqlite3";
+// Session
+$sessionname = 'nsedit_whm';
+// $secret = 'YOUR_VERY_LONG_RANDOM_SECRET_FOR_REMEMBER_ME'; // Uncomment and set for "Remember Me"
 
-# Admin login and password at first start-up
-$default_admin_username = "admin";
-$default_admin_password = "admin";
+// WHM API Settings (CRUCIAL - REPLACE PLACEHOLDERS)
+$whm_host = 'your_whm_server.example.com';
+$whm_port = 2087;
+$whm_user = 'your_whm_username';
+$whm_api_token = 'YOUR_WHM_API_TOKEN'; // Keep this secret!
+$whm_proto = 'https';
+$whm_sslverify = true; // Set to false for self-signed certs (dev only)
 
-# Set a random generated secret to enable auto-login and long living csrf tokens
-// $secret = '...';
+// Database settings (for local user accounts and zone ownership mapping)
+$db_type = 'sqlite';
+$db_file = __DIR__ . '/../nsedit_whm.db'; // Path to SQLite database file
 
-$templates = array();
-/*
-$templates[] = array(
-    'name' => 'Tuxis',
-    'owner' => 'username', # Set to 'public' to make it available to all users
-    'records' => array(
-    array(
-        'name'      => '',
-        'type'      => 'MX',
-        'content'   => '200 mx2.tuxis.nl.'),
-    array(
-        'name'      => '',
-        'type'      => 'A',
-        'content'   => '1.2.3.4'),
-    array(
-        'name'      => 'www',
-        'type'      => 'CNAME',
-        'content'   => '[zonename]')
-    )
+// Default values for new zones (some are less critical with WHM templates)
+$defaults = array(
+    'nameservers' => array('ns1.yourdefaultns.com.', 'ns2.yourdefaultns.com.'), // WHM often sets these
+    'default_primary_ip' => '192.168.0.100', // Example: IP for new A record if not specified
+    'ttl' => 86400,
+    // 'admin_email' => 'hostmaster.example.com.', // Usually from WHM zone template
+    // DNSSEC is managed via WHM API calls, not a simple default flag here
 );
-*/
 
-$defaults['soa_edit']    = 'INCEPTION-INCREMENT';
-$defaults['soa_edit_api'] = 'DEFAULT';
-$defaults['defaulttype'] = 'Master';                    # Choose between 'Native' or 'Master'
-$defaults['ns'][0] = 'unconfigured.primaryns.';         # The value of the first NS-record
-$defaults['ns'][1] = 'unconfigured.secondaryns.';       # The value of the second NS-record
-$defaults['ttl']   = 3600;                              # Default TTL for records
-$defaults['disabled'] = false;                          # Default disabled state
+// User templates (optional)
+$templates = array(
+    /* Example:
+    array(
+        'name' => 'Basic Web Hosting WHM',
+        'description' => 'Standard records for a website (A, www CNAME, MX).',
+        'records' => array(
+            // NS records usually come from WHM server config for new zones
+            array('name' => '', 'type' => 'A', 'content' => '[SERVER_IP]'),
+            array('name' => 'www', 'type' => 'CNAME', 'content' => '[ZONENAME].'),
+            array('name' => '', 'type' => 'MX', 'content' => '10 mail.[ZONENAME].'),
+            array('name' => 'mail', 'type' => 'A', 'content' => '[MAIL_SERVER_IP]')
+        )
+    )
+    */
+);
 
-## UI Options
-$menutype = 'horizontal'; # horizontal|vertical - use a horizontal or vertical menu
-$logo = 'img/nsedit.png';
+// Authentication settings
+$auth_type = 'internal'; // 'internal', 'ldap', 'wefact', 'none'
+$default_user = 'admin'; // For first run if internal auth
+$default_pass = 'password'; // CHANGE THIS IMMEDIATELY!
+
+// LDAP settings (if auth_type is 'ldap')
+// ... (configure as needed)
+
+// WeFact HostFact API settings (if auth_type is 'wefact')
+// ... (configure as needed)
+
+
+// --- DO NOT EDIT BELOW THIS LINE (from original misc.inc.php) ---
+// Error reporting settings (can be kept as is)
+error_reporting(E_ALL & ~E_NOTICE & ~E_STRICT);
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
+if (!empty($logfile)) { // Ensure $logfile is set before using it for error_log
+    ini_set('error_log', $logfile);
+}
+
+
+// Include local overrides if present
+if (file_exists(__DIR__ . '/config.local.inc.php')) {
+    include_once(__DIR__ . '/config.local.inc.php');
+}
+
+?>
