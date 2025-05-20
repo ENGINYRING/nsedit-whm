@@ -68,12 +68,14 @@ $auth_type = 'internal'; // 'internal', 'ldap', 'wefact', 'none'
 $default_user = 'admin'; // For first run if internal auth
 $default_pass = 'password'; // CHANGE THIS IMMEDIATELY!
 
-// LDAP settings (if auth_type is 'ldap')
-// ... (configure as needed)
-
 // WeFact HostFact API settings (if auth_type is 'wefact')
-// ... (configure as needed)
-
+// -------------------------------------------------------
+// If you configure this, nsedit will try to authenticate via WeFact too.
+// Debtors will be added to the sqlitedatabase with their crypted password.
+// (Note: Ensure the WeFact authentication logic in wefactauth.inc.php correctly
+// maps or retrieves a cPanel username if needed for zone permissions).
+$wefact_api_url = 'https://your.wefacthost.com/Pro/apiv2/api.php'; // Example URL
+$wefact_api_key = 'YOUR_WEFACT_API_KEY'; // Your WeFact API Key
 
 // --- DO NOT EDIT BELOW THIS LINE (from original misc.inc.php) ---
 // Error reporting settings (can be kept as is)
