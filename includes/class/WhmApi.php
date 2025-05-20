@@ -271,7 +271,7 @@ class WhmApi {
     private function mapContentToWhmParams(&$params, $type, $content) {
         $type = strtoupper($type);
         // Use a local copy or ensure global is accessible
-        $whmRecordContentFields = [
+        $whmRecordContentFields = [ 
             'A'     => 'address', 'AAAA'  => 'address', 'CNAME' => 'cname',
             'MX'    => ['preference', 'exchange'], 'TXT'   => 'txtdata',
             'SRV'   => ['priority', 'weight', 'port', 'target'], 'NS'    => 'nsdname',
@@ -280,11 +280,15 @@ class WhmApi {
 
         if (!isset($whmRecordContentFields[$type])) {
             if (is_string($content)) {
-                $params['txtdata'] = $content; // A common fallback for unknown simple text types
+                // For TXT-like records (SPF, DKIM often stored as TXT) or unknown types
+                // WHM's 'txtdata' is a common field for string content.
+                $params['txtdata'] = $content; 
+            } elseif (is_array($content) && $type === 'TXT') { // Handle array for TXT if it's split into parts
+                 $params['txtdata'] = implode(" ", array_map(function($part) {
+                    return '"' . str_replace('"', '\"', $part) . '"';
+                 }, $content));
             } else {
-                // Potentially log this or handle more gracefully
-                // For now, if it's not a known type and content isn't a simple string,
-                // it might cause issues with the API call.
+                 error_log("WhmApi::mapContentToWhmParams: Unhandled type '{$type}' or non-string content for unknown type.");
             }
             return;
         }
@@ -308,7 +312,13 @@ class WhmApi {
                 }
             }
         } else { 
-            $params[$whmFields] = $content;
+            if ($type === 'TXT' && is_array($content)) { // Handle array for TXT if it's split into parts
+                 $params[$whmFields] = implode(" ", array_map(function($part) {
+                    return '"' . str_replace('"', '\"', $part) . '"';
+                 }, $content));
+            } else {
+                $params[$whmFields] = $content;
+            }
         }
     }
     
@@ -325,7 +335,7 @@ class WhmApi {
             if (strpos($errorMessage, 'could not find') !== false || 
                 strpos($errorMessage, 'does not exist') !== false ||
                 strpos($errorMessage, 'no such domain') !== false ||
-                (isset($this->apiHandler->last_http_code) && $this->apiHandler->last_http_code == 404) // Approx check
+                (isset($this->apiHandler->last_http_code) && $this->apiHandler->last_http_code == 404) 
             ) {
                 $isNewZone = true;
             } else {
@@ -345,16 +355,12 @@ class WhmApi {
             }
             $this->createWhmZone($domainName, $primaryARecordIp, $cpanelUser);
             foreach ($desiredRecords as $recordData) {
-                // Skip SOA for initial add, adddns creates one.
                 if (strtoupper($recordData['type']) === 'SOA') continue; 
-                // Potentially skip default NS records if adddns handles them sufficiently.
-                // This requires knowledge of what adddns template creates.
                 $this->addWhmRecord($domainName, $recordData);
             }
             return ['status' => 'created', 'domain' => $domainName, 'records_processed' => count($desiredRecords)];
         }
 
-        // Existing Zone: Update Records
         $currentRecordsRaw = isset($liveZoneData['zone']) ? $liveZoneData['zone'] : [];
         $currentRecordsByLine = [];
         foreach ($currentRecordsRaw as $rec) {
@@ -363,77 +369,76 @@ class WhmApi {
 
         $operations = ['added' => 0, 'edited' => 0, 'deleted' => 0, 'unchanged' => 0, 'errors' => []];
         $desiredRecordSignatures = [];
+        
+        $normalizedDomainName = strtolower(rtrim($domainName,'.'));
 
-        // Create signatures for desired records for easier lookup
         foreach ($desiredRecords as $idx => $desiredRec) {
-            $sig = strtolower(rtrim($desiredRec['name'],'.')) . '#' . strtoupper($desiredRec['type']) . '#' . $this->getComparableContent($desiredRec, true);
+            // Normalize desired record name for signature creation
+            $normalizedDesiredName = strtolower(rtrim($desiredRec['name'],'.'));
+            if ($normalizedDesiredName === '@' || $normalizedDesiredName === $normalizedDomainName) {
+                $normalizedDesiredName = $normalizedDomainName; // Ensure apex is consistent
+            }
+
+            $sig = $normalizedDesiredName . '#' . strtoupper($desiredRec['type']) . '#' . $this->getComparableContent($desiredRec, false);
             $desiredRecordSignatures[$sig] = $desiredRec;
             $desiredRecordSignatures[$sig]['_processed_'] = false;
+            $desiredRecordSignatures[$sig]['_original_idx_'] = $idx; // Keep original index if needed
         }
         
-        // Pass 1: Process existing records - check for edits or deletions
         foreach ($currentRecordsByLine as $line => $currentRec) {
-            if (strtoupper($currentRec['type']) === 'SOA') { // SOA is special, usually not deleted/re-added this way
-                // We might want to edit SOA fields if they changed.
-                // For now, let's assume SOA is managed or we compare it.
-                $soaSig = strtolower(rtrim($currentRec['name'],'.')) . '#SOA#' . $this->getComparableContent($currentRec, true);
+            $currentRecNameNormalized = strtolower(rtrim($currentRec['name'],'.'));
+            if ($currentRecNameNormalized === '@' || $currentRecNameNormalized === $normalizedDomainName) {
+                 $currentRecNameNormalized = $normalizedDomainName;
+            }
+
+            if (strtoupper($currentRec['type']) === 'SOA') {
+                $soaSig = $currentRecNameNormalized . '#SOA#' . $this->getComparableContent($currentRec, true);
                 if (isset($desiredRecordSignatures[$soaSig])) {
-                    $desiredRecordSignatures[$soaSig]['_processed_'] = true; // Mark as processed
-                    // Check if SOA content (serial, timings etc.) changed
-                    $desiredSoa = $desiredRecordSignatures[$soaSig];
-                    // Compare relevant SOA fields, if different, call editWhmRecord for SOA line
-                    // This is complex because SOA content is multiple fields.
-                    // For now, we'll simplify and assume SOA is mostly stable or handled by WHM.
+                    $desiredRecordSignatures[$soaSig]['_processed_'] = true; 
                     $operations['unchanged']++;
                 } else {
-                    // SOA in live zone but not in desired state? This is unusual.
-                    // Typically, we don't delete the SOA.
-                    $operations['unchanged']++; // Or log a warning
+                    $operations['unchanged']++; 
                 }
                 continue;
             }
 
-            $currentSig = strtolower(rtrim($currentRec['name'],'.')) . '#' . strtoupper($currentRec['type']) . '#' . $this->getComparableContent($currentRec, true);
-            
             $foundInDesired = false;
-            foreach ($desiredRecordSignatures as $desiredSig => &$desiredRecEntry) { // Use reference
+            foreach ($desiredRecordSignatures as $desiredSig => &$desiredRecEntry) { 
                 if ($desiredRecEntry['_processed_']) continue;
 
-                // More flexible matching: name and type must match. Content for deciding edit vs. new.
-                $tempCurrentName = strtolower(rtrim($currentRec['name'],'.'));
-                $tempDesiredName = strtolower(rtrim($desiredRecEntry['name'],'.'));
-                
-                if ($tempCurrentName === $tempDesiredName && strtoupper($currentRec['type']) === strtoupper($desiredRecEntry['type'])) {
-                    // Potential match. If content also matches, it's unchanged.
-                    // If content differs, it's an edit of this line.
-                    if ($this->getComparableContent($currentRec, true) === $this->getComparableContent($desiredRecEntry, true) &&
+                $desiredRecNameNormalized = strtolower(rtrim($desiredRecEntry['name'],'.'));
+                 if ($desiredRecNameNormalized === '@' || $desiredRecNameNormalized === $normalizedDomainName) {
+                    $desiredRecNameNormalized = $normalizedDomainName;
+                }
+
+                if ($currentRecNameNormalized === $desiredRecNameNormalized && strtoupper($currentRec['type']) === strtoupper($desiredRecEntry['type'])) {
+                    if ($this->getComparableContent($currentRec, true) === $this->getComparableContent($desiredRecEntry, false) &&
                         (int)$currentRec['ttl'] === (int)$desiredRecEntry['ttl']) {
                         $operations['unchanged']++;
                     } else {
                         try {
                             $this->editWhmRecord($domainName, $line, $desiredRecEntry);
                             $operations['edited']++;
-                        } catch (Exception $e) { $operations['errors'][] = "Edit Line {$line}: ".$e->getMessage(); }
+                        } catch (Exception $e) { $operations['errors'][] = "Edit Line {$line} ({$currentRec['name']} {$currentRec['type']}): ".$e->getMessage(); }
                     }
                     $desiredRecEntry['_processed_'] = true;
                     $foundInDesired = true;
                     break;
                 }
             }
-            unset($desiredRecEntry); // Break reference
+            unset($desiredRecEntry); 
 
-            if (!$foundInDesired) { // Current record not found in desired state, so delete it
+            if (!$foundInDesired) { 
                 try {
                     $this->removeWhmRecord($domainName, $line);
                     $operations['deleted']++;
-                } catch (Exception $e) { $operations['errors'][] = "Delete Line {$line}: ".$e->getMessage(); }
+                } catch (Exception $e) { $operations['errors'][] = "Delete Line {$line} ({$currentRec['name']} {$currentRec['type']}): ".$e->getMessage(); }
             }
         }
 
-        // Pass 2: Add any desired records that were not processed (i.e., are new)
         foreach ($desiredRecordSignatures as $sig => $desiredRec) {
             if (!$desiredRec['_processed_']) {
-                 if (strtoupper($desiredRec['type']) === 'SOA') continue; // Don't re-add SOA
+                 if (strtoupper($desiredRec['type']) === 'SOA') continue; 
                 try {
                     $this->addWhmRecord($domainName, $desiredRec);
                     $operations['added']++;
@@ -446,32 +451,35 @@ class WhmApi {
     
     private function getComparableContent($record, $isWhmFormat = false) {
         $type = strtoupper($record['type']);
-        // Use a local copy or ensure global is accessible
-        $whmRecordContentFields = [ /* ... same as above ... */
+        $whmRecordContentFields = [ 
             'A'     => 'address', 'AAAA'  => 'address', 'CNAME' => 'cname',
             'MX'    => ['preference', 'exchange'], 'TXT'   => 'txtdata',
             'SRV'   => ['priority', 'weight', 'port', 'target'], 'NS'    => 'nsdname',
             'PTR'   => 'ptrdname', 'CAA'   => ['flags', 'tag', 'value'],
-            // SOA needs special handling if we were to compare its individual fields
         ];
 
-
-        if ($isWhmFormat) { // Record is from WHM dumpzone, has specific fields
+        $contentValue = '';
+        if ($isWhmFormat) { 
             $fieldsToUse = isset($whmRecordContentFields[$type]) ? $whmRecordContentFields[$type] : null;
             if (is_array($fieldsToUse)) {
                 $parts = [];
-                foreach ($fieldsToUse as $field) { $parts[] = isset($record[$field]) ? $record[$field] : ''; }
-                return implode(' ', $parts);
+                foreach ($fieldsToUse as $field) { $parts[] = isset($record[$field]) ? trim($record[$field]) : ''; }
+                $contentValue = implode(' ', $parts);
             } elseif ($fieldsToUse && isset($record[$fieldsToUse])) {
-                return (string)$record[$fieldsToUse];
+                $contentValue = trim((string)$record[$fieldsToUse]);
+            } elseif (isset($record['rdata'])) { 
+                $contentValue = trim((string)$record['rdata']);
+            } elseif (isset($record['data'])) { 
+                 $contentValue = is_array($record['data']) ? implode(' ', array_map('trim', $record['data'])) : trim((string)$record['data']);
             }
-            // Fallbacks for WHM format if specific field not in map
-            if (isset($record['rdata'])) return (string)$record['rdata'];
-            if (isset($record['data'])) return is_array($record['data']) ? implode(' ', $record['data']) : (string)$record['data'];
-            return ''; // Cannot determine content from WHM structure
-        } else { // Record is from Zone object (desired state), has generic 'content'
-            return is_array($record['content']) ? implode(' ', $record['content']) : (string)$record['content'];
+        } else { 
+            $contentValue = is_array($record['content']) ? implode(' ', array_map('trim', $record['content'])) : trim((string)$record['content']);
         }
+        // For TXT records, WHM might store without quotes, while input might have them. Normalize by removing.
+        if ($type === 'TXT') {
+            return trim($contentValue, '"');
+        }
+        return $contentValue;
     }
 
     /**
@@ -484,25 +492,24 @@ class WhmApi {
         $keys = [];
         $domainNameClean = rtrim($domainName, '.');
 
-        // 1. Get DNSKEY records
         try {
-            // WHM API: export_zone_dnskey
-            // Expected response: { "data": { "dnskey": [ { "key": "base64keydata", "flags": 257, "algorithm": 8, "keytype": "ksk/zsk", "keytag": 12345, "active": 1 }, ... ] } }
-            // The actual response structure can vary, adapt as needed.
-            $dnskeyData = $this->callWhmApi('export_zone_dnskey', ['domain' => $domainNameClean]);
+            $dnskeyDataRaw = $this->callWhmApi('export_zone_dnskey', ['domain' => $domainNameClean]);
             $whmDnskeys = [];
 
-            if (isset($dnskeyData['dnskey']) && is_array($dnskeyData['dnskey'])) {
-                 $whmDnskeys = $dnskeyData['dnskey'];
-            } elseif (is_array($dnskeyData) && isset($dnskeyData[0]['key'])) { // If response is directly the array of keys
-                 $whmDnskeys = $dnskeyData;
+            // The WHM API for export_zone_dnskey might return data directly or nested under 'dnskey' or 'payload'
+            if (isset($dnskeyDataRaw['dnskey']) && is_array($dnskeyDataRaw['dnskey'])) {
+                 $whmDnskeys = $dnskeyDataRaw['dnskey'];
+            } elseif (isset($dnskeyDataRaw[0]['key'])) { // If response is directly the array of keys
+                 $whmDnskeys = $dnskeyDataRaw;
+            } elseif (isset($dnskeyDataRaw['payload']['dnskey']) && is_array($dnskeyDataRaw['payload']['dnskey'])) { // another possible structure
+                 $whmDnskeys = $dnskeyDataRaw['payload']['dnskey'];
             }
 
 
             foreach ($whmDnskeys as $idx => $keyInfo) {
                 if (!isset($keyInfo['key']) || !isset($keyInfo['flags']) || !isset($keyInfo['algorithm'])) continue;
 
-                $protocol = 3; // Standard for DNSSEC
+                $protocol = 3; 
                 $dnskey_string = $keyInfo['flags'] . ' ' . $protocol . ' ' . $keyInfo['algorithm'] . ' ' . $keyInfo['key'];
                 
                 $keytypeDisplay = 'Unknown';
@@ -515,67 +522,64 @@ class WhmApi {
                 }
                 
                 $keys[$idx] = [
-                    'id' => $keyInfo['keytag'] ?? ('key_' . $idx), // Use keytag if available
+                    'id' => $keyInfo['keytag'] ?? ('key_' . $idx), 
                     'keytag' => $keyInfo['keytag'] ?? null,
-                    'active' => isset($keyInfo['active']) ? (bool)$keyInfo['active'] : false, // Default to false if not specified
+                    'active' => isset($keyInfo['active']) ? (bool)$keyInfo['active'] : false, 
                     'keytype' => $keytypeDisplay,
-                    'algorithm' => $keyInfo['algorithm'], // Store algorithm number
+                    'algorithm_number' => $keyInfo['algorithm'], // Store algorithm number
+                    'algorithm_name' => $this->getDnssecAlgorithmName($keyInfo['algorithm']), // Get friendly name
                     'flags' => $keyInfo['flags'],
                     'dnskey_record_text' => $domainNameClean . '. IN DNSKEY ' . $dnskey_string,
-                    'ds_records_text' => [], // Will be populated by fetch_ds_records_for_domains
-                    'dstxt' => $domainNameClean . '. IN DNSKEY ' . $dnskey_string . "\n", // Start building dstxt
+                    'ds_records_text' => [], 
+                    'dstxt' => $domainNameClean . '. IN DNSKEY ' . $dnskey_string . "\n", 
                 ];
             }
         } catch (Exception $e) {
             error_log("WHM API getzonekeys (export_zone_dnskey) failed for {$domainNameClean}: " . $e->getMessage());
-            // Continue to try fetching DS records even if DNSKEYs fail, or return empty
         }
 
-        // 2. Get DS records (from parent, if WHM can provide them)
         try {
-            // WHM API: fetch_ds_records_for_domains
-            // Expected response: { "data": { "ds_records": [ { "domain": "example.com", "keytag": 12345, "algorithm": 8, ... "digest": "...", "digest_type": 2 }, ... ] } }
-            // Or it might return an array of full DS record strings.
-            $dsData = $this->callWhmApi('fetch_ds_records_for_domains', ['domain' => $domainNameClean]);
+            $dsDataRaw = $this->callWhmApi('fetch_ds_records_for_domains', ['domain' => $domainNameClean]);
             $whmDsRecords = [];
-
-            if (isset($dsData['ds_records']) && is_array($dsData['ds_records'])) {
-                $whmDsRecords = $dsData['ds_records'];
-            } elseif (is_array($dsData) && (isset($dsData[0]['keytag']) || (isset($dsData[0]) && is_string($dsData[0])) ) ) { // If response is directly the array
-                $whmDsRecords = $dsData;
+            
+            // DS records might be under 'ds_records', 'payload', or directly an array
+            if (isset($dsDataRaw['ds_records']) && is_array($dsDataRaw['ds_records'])) {
+                $whmDsRecords = $dsDataRaw['ds_records'];
+            } elseif (isset($dsDataRaw['payload']) && is_array($dsDataRaw['payload'])) {
+                $whmDsRecords = $dsDataRaw['payload'];
+            } elseif (is_array($dsDataRaw) && (isset($dsDataRaw[0]['keytag']) || (isset($dsDataRaw[0]) && is_string($dsDataRaw[0])) ) ) { 
+                $whmDsRecords = $dsDataRaw;
             }
 
-
             foreach ($whmDsRecords as $dsInfo) {
-                $ds_string = '';
-                if (is_string($dsInfo)) { // If it's a full DS record string
-                    $ds_string = $dsInfo;
+                $ds_string_parts = [];
+                if (is_string($dsInfo)) { 
+                    $ds_string_parts = preg_split('/\s+/', $dsInfo, 4); // keytag alg digesttype digest
                 } elseif (is_array($dsInfo) && isset($dsInfo['keytag']) && isset($dsInfo['algorithm']) && isset($dsInfo['digest_type']) && isset($dsInfo['digest'])) {
-                    $ds_string = $dsInfo['keytag'] . ' ' . $dsInfo['algorithm'] . ' ' . $dsInfo['digest_type'] . ' ' . strtoupper($dsInfo['digest']);
+                    $ds_string_parts = [$dsInfo['keytag'], $dsInfo['algorithm'], $dsInfo['digest_type'], strtoupper($dsInfo['digest'])];
                 }
 
-                if (!empty($ds_string)) {
-                    $ds_record_text = $domainNameClean . '. IN DS ' . $ds_string;
-                    // Try to associate with a DNSKEY or add as a general DS entry
+                if (count($ds_string_parts) === 4) {
+                    $ds_record_text = $domainNameClean . '. IN DS ' . implode(' ', $ds_string_parts);
+                    $keytag_from_ds = (int)$ds_string_parts[0];
                     $associated = false;
-                    if (isset($dsInfo['keytag'])) {
-                        foreach ($keys as &$keyEntry) { // Use reference to modify
-                            if (isset($keyEntry['keytag']) && $keyEntry['keytag'] == $dsInfo['keytag']) {
-                                $keyEntry['ds_records_text'][] = $ds_record_text;
-                                $keyEntry['dstxt'] .= $ds_record_text . "\n";
-                                $associated = true;
-                                break;
-                            }
+                    foreach ($keys as $key_idx => &$keyEntry) { 
+                        if (isset($keyEntry['keytag']) && (int)$keyEntry['keytag'] === $keytag_from_ds) {
+                            $keyEntry['ds_records_text'][] = $ds_record_text;
+                            $keyEntry['dstxt'] .= $ds_record_text . "\n";
+                            $associated = true;
+                            break;
                         }
-                        unset($keyEntry); // Break reference
                     }
-                    if (!$associated) { // If DS couldn't be matched to a specific keytag or no keys yet
-                        $keys[] = [ // Add as a new entry, primarily for the DS record
-                            'id' => 'ds_' . ($dsInfo['keytag'] ?? count($keys)),
-                            'active' => true, // Assume active if present
-                            'keytype' => 'DS Record',
-                            'algorithm' => $dsInfo['algorithm'] ?? null,
-                            'keytag' => $dsInfo['keytag'] ?? null,
+                    unset($keyEntry); 
+                    if (!$associated) { 
+                        $keys[] = [ 
+                            'id' => 'ds_' . $keytag_from_ds . '_' . (count($keys)),
+                            'active' => true, 
+                            'keytype' => 'DS Record (Unmatched)',
+                            'algorithm_number' => (int)$ds_string_parts[1],
+                            'algorithm_name' => $this->getDnssecAlgorithmName((int)$ds_string_parts[1]),
+                            'keytag' => $keytag_from_ds,
                             'dnskey_record_text' => '',
                             'ds_records_text' => [$ds_record_text],
                             'dstxt' => $ds_record_text . "\n",
@@ -587,48 +591,122 @@ class WhmApi {
             error_log("WHM API getzonekeys (fetch_ds_records_for_domains) failed for {$domainNameClean}: " . $e->getMessage());
         }
         
-        // Ensure dstxt is properly formatted
         foreach ($keys as &$keyEntry) {
             $keyEntry['dstxt'] = trim($keyEntry['dstxt']);
         }
         unset($keyEntry);
 
-        return array_values($keys); // Return re-indexed array
+        return array_values($keys); 
     }
+
+    /**
+     * Parses raw zone file text using WHM's parse_dns_zone API.
+     * Decodes base64 fields from the response.
+     *
+     * @param string $domainName The domain name the zone text belongs to.
+     * @param string $zoneFileText The raw zone file content.
+     * @return array ['soa' => decoded_soa_data, 'records' => array_of_decoded_records]
+     * @throws Exception If API call or parsing fails.
+     */
+    public function parseZoneFileText($domainName, $zoneFileText) {
+        $params = [
+            'zone' => rtrim($domainName, '.'), // WHM API often prefers no trailing dot for 'zone' param
+            'zonefile_text' => $zoneFileText
+        ];
+        // parse_dns_zone returns data under 'payload' for records and 'soa' for SOA.
+        // Fields like dname_b64, record_type_b64, data_b64 need decoding.
+        $responseData = $this->callWhmApi('parse_dns_zone', $params);
+
+        $decodedRecords = [];
+        $decodedSoa = null;
+
+        if (isset($responseData['payload']) && is_array($responseData['payload'])) {
+            foreach ($responseData['payload'] as $rawRecord) {
+                $record = [];
+                foreach ($rawRecord as $key => $value) {
+                    if (strpos($key, '_b64') !== false) {
+                        $newKey = str_replace('_b64', '', $key);
+                        if (is_array($value)) { // 'data_b64' can be an array of strings
+                            $record[$newKey] = array_map('base64_decode', $value);
+                        } else {
+                            $record[$newKey] = base64_decode($value);
+                        }
+                    } else {
+                        $record[$key] = $value;
+                    }
+                }
+                // Ensure standard field names like 'name', 'type', 'ttl', 'content'
+                if (isset($record['dname'])) $record['name'] = rtrim($record['dname'],'.').'.';
+                if (isset($record['record_type'])) $record['type'] = strtoupper($record['record_type']);
+                if (isset($record['data'])) { // 'data' is an array of content parts
+                    $record['content'] = count($record['data']) === 1 ? $record['data'][0] : $record['data'];
+                }
+                $decodedRecords[] = $record;
+            }
+        }
+
+        if (isset($responseData['soa']) && is_array($responseData['soa'])) {
+            $decodedSoa = [];
+            foreach ($responseData['soa'] as $key => $value) {
+                 if (strpos($key, '_b64') !== false) {
+                    $newKey = str_replace('_b64', '', $key);
+                    $decodedSoa[$newKey] = base64_decode($value);
+                } else {
+                    $decodedSoa[$key] = $value;
+                }
+            }
+            // Standardize SOA fields
+            if (isset($decodedSoa['dname'])) $decodedSoa['name'] = rtrim($decodedSoa['dname'],'.').'.';
+            $decodedSoa['type'] = 'SOA';
+             // Construct content string for SOA for consistency if needed by Zone class
+            $soaContentParts = [];
+            foreach (['mname', 'rname', 'serial', 'refresh', 'retry', 'expire', 'minimum'] as $field) {
+                $soaContentParts[] = $decodedSoa[$field] ?? '';
+            }
+            $decodedSoa['content'] = implode(' ', $soaContentParts);
+
+        }
+        
+        // Ensure SOA is also part of the records list if not already
+        if ($decodedSoa) {
+            $soaInRecords = false;
+            foreach($decodedRecords as $rec) {
+                if (isset($rec['type']) && $rec['type'] === 'SOA') {
+                    $soaInRecords = true;
+                    break;
+                }
+            }
+            if (!$soaInRecords) {
+                $soaForList = $decodedSoa;
+                // 'line_index' might not be present for SOA from 'soa' part of response
+                $soaForList['line_index'] = $decodedSoa['line_index'] ?? 0; // Default to 0 or find
+                $decodedRecords[] = $soaForList;
+            }
+        }
+
+
+        return ['soa' => $decodedSoa, 'records' => $decodedRecords];
+    }
+    
+    private function getDnssecAlgorithmName($algoNumber) {
+        // Based on IANA DNS Security Algorithm Numbers:
+        // https://www.iana.org/assignments/dns-sec-alg-numbers/dns-sec-alg-numbers.xhtml
+        $algos = [
+            1 => "RSA/MD5 (deprecated)", 2 => "Diffie-Hellman (deprecated)", 3 => "DSA/SHA-1 (deprecated)",
+            4 => "Elliptic Curve (deprecated)", 5 => "RSA/SHA-1 (deprecated)", 6 => "DSA-NSEC3-SHA1 (deprecated)",
+            7 => "RSASHA1-NSEC3-SHA1 (deprecated)", 8 => "RSA/SHA-256", 10 => "RSA/SHA-512",
+            12 => "GOST R 34.10-2001 (deprecated)", 13 => "ECDSA/P-256/SHA-256", 14 => "ECDSA/P-384/SHA-384",
+            15 => "Ed25519", 16 => "Ed448"
+            // Add more as needed
+        ];
+        return $algos[$algoNumber] ?? "Unknown ({$algoNumber})";
+    }
+
 }
 ?>
 ```
 
-**Key Changes in `WhmApi::getzonekeys()`:**
-
-1.  **API Calls:**
-    * It now attempts to call `export_zone_dnskey` to retrieve DNSKEY records.
-    * It then attempts to call `fetch_ds_records_for_domains` to retrieve DS records.
-    * Both calls are wrapped in `try-catch` blocks to handle cases where these API functions might not be available, not enabled for the domain, or return errors.
-
-2.  **Response Parsing (Assumed Structures):**
-    * **`export_zone_dnskey`:** The code assumes a response structure like `{ "data": { "dnskey": [ { "key": "base64keydata", "flags": 257, ... }, ... ] } }` or a direct array of key objects. It extracts `keytag`, `flags`, `algorithm`, `active`, and the base64 `key` material.
-    * **`fetch_ds_records_for_domains`:** Assumes a response like `{ "data": { "ds_records": [ { "keytag": ..., "digest": "..." }, ... ] } }` or an array of full DS record strings.
-
-3.  **Data Construction:**
-    * For each DNSKEY, it constructs the standard `DNSKEY` record string (e.g., `example.com. IN DNSKEY 257 3 8 base64keydata...`).
-    * It tries to associate DS records with their corresponding DNSKEYs using the `keytag`.
-    * The `dstxt` field is built up to include both the `DNSKEY` record and its associated `DS` records, similar to the original PowerDNS output.
-    * If DS records are found but cannot be matched to a specific DNSKEY (or if no DNSKEYs were found), they are added as separate entries in the `$keys` array.
-
-4.  **Return Structure:**
-    * The method aims to return an array of key objects. Each object should ideally contain:
-        * `id`: A unique identifier (uses `keytag` if available).
-        * `keytag`: The key tag.
-        * `active`: Boolean indicating if the key is active.
-        * `keytype`: 'KSK', 'ZSK', or 'DS Record'.
-        * `algorithm`: The algorithm number.
-        * `dnskey_record_text`: The full DNSKEY record string.
-        * `ds_records_text`: An array of full DS record strings associated with this key.
-        * `dstxt`: A combined string of the DNSKEY and its DS records, formatted for display.
-
-**Next, update `zones.php` to use this refined `getzonekeys` method.**
-The `getzonekeys` action in `zones.php` needs to be adjusted to call this and ensure the response is correctly formatted for the `displayDnssecIcon` JavaScript function in `index.php`.
+Next, I'll update the `create` action in `zones.php` (Canvas ID `nsedit_whm_zones_controller`) to use this new `parseZoneFileText` method.
 
 
 ```php
@@ -1019,6 +1097,7 @@ try {
             $domainName = isset($_POST['name']) ? rtrim(trim($_POST['name']), '.') : '';
             $cpanelUser = isset($_POST['account']) ? $_POST['account'] : get_sess_user(); 
             $primaryIp = isset($_POST['primary_ip']) ? $_POST['primary_ip'] : ($defaults['default_primary_ip'] ?? ''); 
+            $rawZoneText = isset($_POST['zone']) ? $_POST['zone'] : null;
 
             if (!is_adminuser() && $allowzoneadd !== TRUE) {
                 jtable_respond(null, 'error', "You are not allowed to add zones.");
@@ -1043,34 +1122,90 @@ try {
                  exit;
             }
 
-            $zone = new Zone($domainName);
-            $zone->setCpanelUser($cpanelUser);
-            
-            // If raw zone data is pasted (this part needs more robust implementation)
-            if (!empty($_POST['zone'])) {
-                writelog("Zone creation from raw text input initiated for {$domainName}. This feature requires WhmApi to support parsing and applying full zone text.");
-                // Placeholder: A more robust implementation would involve:
-                // 1. $api->createWhmZone($domainName, $primaryIp, $cpanelUser); // Create basic zone
-                // 2. $parsedRecords = $api->parseZoneFileText($domainName, $_POST['zone']); // New method in WhmApi
-                // 3. foreach ($parsedRecords as $rec) { $api->addWhmRecord($domainName, $rec); }
-                // For now, we'll proceed as if it's a new zone with defaults/template.
-                // The savezone call below will handle adding default records if any are in $zone object.
-            }
-            
-            if (isset($defaults['nameservers']) && is_array($defaults['nameservers'])) {
-                foreach ($defaults['nameservers'] as $ns) {
-                    $zone->addRecord($domainName, 'NS', $ns, $defaults['ttl'] ?? 14400);
-                }
-            }
-             if (isset($defaults['mail_servers']) && is_array($defaults['mail_servers'])) {
-                foreach ($defaults['mail_servers'] as $mx) {
-                     $zone->addRecord($domainName, 'MX', (isset($mx['priority']) ? $mx['priority'] . ' ' : '10 ') . $mx['host'], $defaults['ttl'] ?? 14400);
-                }
-            }
+            // Create the basic zone first
+            $api->createWhmZone($domainName, $primaryIp, $cpanelUser);
+            writelog("Basic zone {$domainName} created for user {$cpanelUser} with IP {$primaryIp}.");
 
-            $result = $api->savezone($zone, $cpanelUser, $primaryIp);
+            $zone = new Zone($domainName); // Create Zone object for further operations
+            $zone->setCpanelUser($cpanelUser);
+
+            if (!empty($rawZoneText)) {
+                writelog("Attempting to import records from provided zone text for {$domainName}.");
+                try {
+                    $parsedZoneData = $api->parseZoneFileText($domainName, $rawZoneText);
+                    if (isset($parsedZoneData['records']) && is_array($parsedZoneData['records'])) {
+                        $recordsToAdd = [];
+                        foreach ($parsedZoneData['records'] as $parsedRecord) {
+                            // Skip SOA from imported text as adddns creates one.
+                            // Also, WHM's adddns likely sets up default NS records.
+                            // Be cautious about overwriting or duplicating them.
+                            // It's safer to skip NS from imported text if 'owns' (overwrite NS) isn't checked/handled.
+                            $type = strtoupper($parsedRecord['type'] ?? '');
+                            if ($type === 'SOA') continue;
+                            
+                            // If 'owns' (overwrite nameservers) is not set (or not '1'), skip NS records from import
+                            $overwriteNameservers = isset($_POST['owns']) && $_POST['owns'] == '1';
+                            if ($type === 'NS' && !$overwriteNameservers) {
+                                writelog("Skipping NS record from import for {$domainName} as overwrite not specified.");
+                                continue;
+                            }
+
+                            // Construct record data for addWhmRecord
+                            // Ensure 'content' is in the generic format expected by mapContentToWhmParams
+                            $recordData = [
+                                'name' => $parsedRecord['name'] ?? $domainName,
+                                'type' => $type,
+                                'ttl'  => isset($parsedRecord['ttl']) ? (int)$parsedRecord['ttl'] : ($defaults['ttl'] ?? 14400),
+                                'class'=> $parsedRecord['class'] ?? 'IN',
+                                'content' => $parsedRecord['content'] ?? (isset($parsedRecord['data']) ? (is_array($parsedRecord['data']) ? implode(' ', $parsedRecord['data']) : $parsedRecord['data']) : '')
+                            ];
+                            $recordsToAdd[] = $recordData;
+                        }
+
+                        // Add these records one by one
+                        // A batch operation (mass_edit_dns_zone) would be more efficient here
+                        foreach ($recordsToAdd as $recordData) {
+                            try {
+                                $api->addWhmRecord($domainName, $recordData);
+                                writelog("Added imported record to {$domainName}: {$recordData['name']} {$recordData['type']}");
+                            } catch (Exception $e) {
+                                writelog("Error adding imported record {$recordData['name']} {$recordData['type']} to {$domainName}: " . $e->getMessage());
+                            }
+                        }
+                    } else {
+                        writelog("No records found or error parsing provided zone text for {$domainName}.");
+                    }
+                } catch (Exception $e) {
+                    writelog("Error processing provided zone text for {$domainName}: " . $e->getMessage());
+                    // Continue with template/default records even if import fails
+                }
+            } else {
+                // Add default NS records if provided in config and not importing text (or if 'owns' is true)
+                $applyDefaultNS = true;
+                if (!empty($rawZoneText) && isset($_POST['owns']) && $_POST['owns'] != '1') {
+                    $applyDefaultNS = false; // Don't apply default NS if importing text and not overwriting NS
+                }
+
+                if ($applyDefaultNS && isset($defaults['nameservers']) && is_array($defaults['nameservers'])) {
+                    foreach ($defaults['nameservers'] as $ns) {
+                        $zone->addRecord($domainName, 'NS', $ns, $defaults['ttl'] ?? 14400);
+                    }
+                }
+                // Add default MX record if in config
+                 if (isset($defaults['mail_servers']) && is_array($defaults['mail_servers'])) {
+                    foreach ($defaults['mail_servers'] as $mx) {
+                         $zone->addRecord($domainName, 'MX', (isset($mx['priority']) ? $mx['priority'] . ' ' : '10 ') . $mx['host'], $defaults['ttl'] ?? 14400);
+                    }
+                }
+                // If there are records in the $zone object from defaults, save them
+                if (count($zone->getRecordsArray()) > 0) { // getRecordsArray needs to be records added locally
+                    $api->savezone($zone, $cpanelUser, $primaryIp); // This savezone will add these records
+                }
+            }
+            
             add_db_zone($zone->getName(), $cpanelUser); 
 
+            // Apply template if selected (after initial zone creation and potential import)
             if (isset($_POST['template']) && $_POST['template'] != 'None' && !empty($templates)) {
                 $templateData = null;
                 foreach ($templates as $t) {
@@ -1080,7 +1215,7 @@ try {
                     }
                 }
                 if ($templateData) {
-                    $currentZoneData = $api->loadzone($domainName); // Re-load to get current state
+                    $currentZoneData = $api->loadzone($domainName); // Re-load to get current state after import/defaults
                     $zone->parseWhmData($currentZoneData); 
 
                     foreach ($templateData['records'] as $recordTpl) {
@@ -1088,16 +1223,17 @@ try {
                         $recordContent = str_replace('[ZONENAME]', $zone->getName(), $recordTpl['content']);
                         $recordContent = str_replace('[SERVER_IP]', $primaryIp, $recordContent); 
                         
+                        // Add to local zone object; savezone will handle API calls
                         $zone->addRecord($recordName, $recordTpl['type'], $recordContent, $recordTpl['ttl'] ?? ($defaults['ttl'] ?? 14400));
                     }
-                    $api->savezone($zone, $cpanelUser, $primaryIp); 
+                    $api->savezone($zone, $cpanelUser, $primaryIp); // Save again with template records
                 }
             }
             
             $finalZoneData = $api->loadzone($domainName);
             $zone->parseWhmData($finalZoneData);
 
-            writelog("Created zone " . $zone->getName() . " for cPanel user " . $cpanelUser);
+            writelog("Finished creating zone " . $zone->getName() . " for cPanel user " . $cpanelUser);
             $soaDisplay = $zone->formatRecordForApp($zone->getSoaData() ?: ['name'=>$zone->getName(), 'type'=>'SOA', 'content'=>'Default SOA', 'ttl'=>3600]);
             jtable_respond($soaDisplay, 'single'); 
             break;
@@ -1174,7 +1310,7 @@ try {
 
             $apiResponse = $api->addWhmRecord($domainName, $recordData);
             
-            $newRecordForTable = $recordData; // Use the data sent
+            $newRecordForTable = $recordData; 
             $newRecordForTable['id'] = json_encode($newRecordForTable); 
 
             writelog("Created record for {$domainName}: " . json_encode($newRecordForTable));
@@ -1426,4 +1562,4 @@ try {
     jtable_respond(null, 'error', "An API error occurred: " . htmlspecialchars($e->getMessage()));
 }
 
-?> 
+?>
